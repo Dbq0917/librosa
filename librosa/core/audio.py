@@ -18,7 +18,7 @@ from .._cache import cache
 from ..util.decorators import future_default
 from ..util.exceptions import ParameterError
 from ..util.files import example
-from ..util.streaming import StreamBridge, _StreamBuffer, _align_step_size
+from ..util.streaming import StreamBridge, _align_step_size, _StreamBuffer
 from .convert import frames_to_samples, time_to_samples
 
 if TYPE_CHECKING:
@@ -382,13 +382,11 @@ def stream(
     ...                                              center=False)
     """
     if isinstance(path, StreamBridge):
-        buf = _StreamBuffer(
+        yield from path.stream(
+            block_length=block_length,
             frame_length=frame_length,
             hop_length=hop_length,
-            block_length=block_length,
-            orig_sr=path.sr,
             sr=sr,
-            channels=path.channels,
             mono=mono,
             offset=offset,
             duration=duration,
@@ -397,13 +395,6 @@ def stream(
             res_type=res_type,
             dtype=dtype,
         )
-        for chunk in path:
-            for block in buf.push(chunk):
-                yield block
-            if buf.is_complete():
-                break
-        for block in buf.flush():
-            yield block
         return
 
     is_file = (
@@ -457,10 +448,8 @@ def stream(
         )
 
         for chunk in chunk_iter:
-            for block in buf.push(chunk.T):
-                yield block
-        for block in buf.flush():
-            yield block
+            yield from buf.push(chunk.T)
+        yield from buf.flush()
     finally:
         if sfo_close is not None:
             sfo_close.close()
@@ -545,13 +534,11 @@ async def astream(
     if not isinstance(stream, StreamBridge):
         raise ParameterError(f"Unsupported source type for astream: {type(stream)}")
 
-    buf = _StreamBuffer(
+    async for block in stream.astream(
+        block_length=block_length,
         frame_length=frame_length,
         hop_length=hop_length,
-        block_length=block_length,
-        orig_sr=stream.sr,
         sr=sr,
-        channels=stream.channels,
         mono=mono,
         offset=offset,
         duration=duration,
@@ -559,15 +546,7 @@ async def astream(
         fill_value=fill_value,
         res_type=res_type,
         dtype=dtype,
-    )
-
-    async for chunk in stream:
-        for block in buf.push(chunk):
-            yield block
-        if buf.is_complete():
-            break
-
-    for block in buf.flush():
+    ):
         yield block
 
 
