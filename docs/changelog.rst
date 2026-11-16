@@ -2,6 +2,22 @@
 Changelog
 *********
 
+v1.0.2
+------
+
+Bug fixes
+    - `display.waveshow` and `display.wavebars` now center each channel by
+      removing its DC offset before computing the amplitude envelope, and use
+      per-frame positive maximum / negative minimum instead of a mirrored
+      absolute-value envelope.  The upper and lower envelopes are therefore
+      anchored to a zero baseline (no drift from DC bias or resampling),
+      preserve true peak asymmetry, and remain comparable between mono and
+      stereo input.  Stereo channels are still processed independently rather
+      than being down-mixed.  Signals shorter than one envelope frame no
+      longer raise an error.  This changes the reported envelope values, so
+      downstream consumers that read the envelope numerically should update
+      their expectations.
+
 v1.0
 ====
 

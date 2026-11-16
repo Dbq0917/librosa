@@ -1772,6 +1772,136 @@ def test_wavebars_nbars_validation():
     plt.close(fig)
 
 
+@pytest.fixture
+def envelope_signals():
+    sr = 48000
+    n = sr
+    t = np.arange(n) / sr
+    amp = 0.5
+    tone = amp * np.sin(2 * np.pi * 440.0 * t)
+    return sr, n, amp, tone
+
+
+def test_envelope_shape_contract(envelope_signals):
+    n, tone = envelope_signals[1], envelope_signals[3]
+    hop = 512
+    env = librosa.display.signal._envelope(tone[np.newaxis, :], hop)
+    # (n_channels, {upper, lower}, n_frames)
+    assert env.ndim == 3
+    assert env.shape[0] == 1
+    assert env.shape[1] == 2
+    assert env.shape[2] == n // hop
+    assert np.all(env[:, 0] >= 0)
+    assert np.all(env[:, 1] <= 0)
+
+
+@pytest.mark.parametrize("dc", [0.0, 0.2, -0.3])
+def test_envelope_zero_baseline_symmetric(envelope_signals, dc):
+    # A symmetric tone, with or without DC offset, must produce upper and
+    # lower envelopes that are symmetric around a zero baseline.
+    amp, tone = envelope_signals[2], envelope_signals[3]
+    hop = 512
+    env = librosa.display.signal._envelope((tone + dc)[np.newaxis, :], hop)[0]
+    upper, lower = env[0], env[1]
+    # tolerance accommodates non-integer-cycle framing boundaries
+    assert np.max(np.abs(upper + lower)) <= 5e-3 * amp
+    # DC bias must not inflate the envelope beyond the tone's own amplitude
+    assert upper.max() <= amp + 1e-9
+
+
+def test_envelope_dc_removal_matches_clean(envelope_signals):
+    tone = envelope_signals[3]
+    hop = 512
+    clean = librosa.display.signal._envelope(tone[np.newaxis, :], hop)
+    biased = librosa.display.signal._envelope((tone + 0.25)[np.newaxis, :], hop)
+    assert np.allclose(clean, biased, atol=1e-6)
+
+
+def test_envelope_pure_dc_collapses_to_zero():
+    env = librosa.display.signal._envelope(np.full((1, 4096), 0.3), 512)
+    assert np.allclose(env, 0.0, atol=1e-12)
+
+
+def test_envelope_retains_true_min_max(envelope_signals):
+    # Unlike an absolute-value envelope, genuine positive/negative peak
+    # asymmetry must be preserved rather than force-mirrored.
+    n = envelope_signals[1]
+    rng = np.random.default_rng(0)
+    voice = rng.standard_normal(n).cumsum()
+    voice = voice / np.max(np.abs(voice)) * 0.8 + 0.15
+    hop = 512
+    centered = voice - voice.mean()
+    frames = librosa.util.frame(centered, frame_length=hop, hop_length=hop)
+    env = librosa.display.signal._envelope(voice[np.newaxis, :], hop)[0]
+    assert np.allclose(env[0], frames.max(axis=0))
+    assert np.allclose(env[1], frames.min(axis=0))
+
+
+def test_envelope_stereo_per_channel_no_downmix(envelope_signals):
+    amp, tone = envelope_signals[2], envelope_signals[3]
+    hop = 512
+    # 180-degree phase inversion with different per-channel DC offsets
+    stereo = np.stack([tone + 0.1, -tone - 0.1], axis=0)
+    env = librosa.display.signal._envelope(stereo, hop)
+    assert env.shape[0] == 2
+    # Each channel is centered independently and stays symmetric around zero
+    for channel in range(2):
+        assert np.max(np.abs(env[channel, 0] + env[channel, 1])) <= 5e-3 * amp
+    # A downmix would cancel the signal; the per-channel envelopes stay large
+    assert env[0, 0].max() > 0.4
+    assert env[1, 1].min() < -0.4
+    # Different DC offsets on identical content must not change the envelope
+    offset_pair = np.stack([tone + 0.3, tone - 0.3], axis=0)
+    env_offset = librosa.display.signal._envelope(offset_pair, hop)
+    assert np.allclose(env_offset[0], env_offset[1], atol=1e-6)
+
+
+@pytest.mark.parametrize("n_samples", [0, 1, 3, 511, 512, 513])
+def test_envelope_short_inputs_do_not_crash(n_samples):
+    hop = 512
+    rng = np.random.default_rng(1)
+    signal = rng.standard_normal(n_samples) if n_samples else np.zeros(0)
+    env = librosa.display.signal._envelope(signal[np.newaxis, :], hop)
+    assert env.shape == (1, 2, 1)
+    assert np.isfinite(env).all()
+
+
+def test_waveshow_short_signal_does_not_crash(envelope_signals):
+    sr = envelope_signals[0]
+    fig, ax = plt.subplots()
+    short = np.array([0.1, -0.2, 0.05])
+    adaptor = librosa.display.waveshow(short, sr=sr, ax=ax)
+    assert isinstance(adaptor, librosa.display.AdaptiveWaveplot)
+    librosa.display.wavebars(short, sr=sr, ax=ax)
+    plt.close(fig)
+
+
+@pytest.mark.parametrize("plotter", ["waveshow", "wavebars"])
+def test_waveplot_empty_signal_raises(plotter):
+    fig, ax = plt.subplots()
+    with pytest.raises(librosa.ParameterError):
+        if plotter == "waveshow":
+            librosa.display.waveshow(np.empty(0), sr=48000, ax=ax)
+        else:
+            librosa.display.wavebars(np.empty(0), sr=48000, ax=ax)
+    plt.close(fig)
+
+
+@pytest.mark.parametrize("transpose", [False, True])
+def test_wavebars_bars_span_zero_baseline(envelope_signals, transpose):
+    # Bars must extend both above and below the zero baseline, matching the
+    # signed upper/lower envelope rather than collapsing onto one side.
+    amp, tone = envelope_signals[2], envelope_signals[3]
+    biased = tone + 0.2
+    fig, ax = plt.subplots()
+    coll = librosa.display.wavebars(biased, sr=48000, n_bars=64, ax=ax, transpose=transpose)
+    vertices = np.concatenate([path.vertices for path in coll.get_paths()], axis=0)
+    value_axis = vertices[:, 1] if not transpose else vertices[:, 0]
+    assert value_axis.min() < -amp * 0.5
+    assert value_axis.max() > amp * 0.5
+    plt.close(fig)
+
+
 @pytest.mark.mpl_image_compare(
     baseline_images=["wavef0"],
     extensions=["png"],

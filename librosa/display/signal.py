@@ -343,12 +343,44 @@ if _WaveplotDecoy not in Legend.get_default_handler_map():
 
 
 def _envelope(x, hop):
-    """Compute the max-envelope of non-overlapping frames of x at length hop
+    """Compute the upper and lower amplitude envelopes of x.
 
-    x is assumed to be multi-channel, of shape (n_channels, n_samples).
+    Each channel is first centered by subtracting its mean (DC offset) so that
+    the envelopes are anchored to a zero baseline rather than drifting with DC
+    bias or resampling artifacts.  Non-overlapping frames of length ``hop`` are
+    then summarized independently by their positive maximum and negative
+    minimum, preserving asymmetric peaks instead of collapsing both sides into
+    a mirrored absolute-value envelope.
+
+    Parameters
+    ----------
+    x : np.ndarray [shape=(n_channels, n_samples)]
+        Multi-channel input signal.
+    hop : int > 0
+        Frame length and hop length in samples.
+
+    Returns
+    -------
+    env : np.ndarray [shape=(n_channels, 2, n_frames)]
+        Per-channel envelopes.  ``env[:, 0]`` holds the upper (max) envelope
+        and ``env[:, 1]`` holds the lower (min) envelope.
     """
-    x_frame = np.abs(util.frame(x, frame_length=hop, hop_length=hop))
-    return x_frame.max(axis=1)
+    # An empty signal carries no envelope information; return a single,
+    # all-zero frame instead of letting framing or the mean computation fail.
+    n = x.shape[-1]
+    if n == 0:
+        return np.zeros((x.shape[0], 2, 1), dtype=x.dtype)
+
+    # Remove the per-channel DC offset so the envelope baseline stays at zero.
+    x = x - np.mean(x, axis=-1, keepdims=True)
+
+    # Signals shorter than a single frame cannot be framed; pad by repeating
+    # the last sample so that short inputs still yield one frame.
+    if n < hop:
+        x = np.pad(x, ((0, 0), (0, hop - n)), mode="edge")
+
+    x_frame = util.frame(x, frame_length=hop, hop_length=hop)
+    return np.stack((x_frame.max(axis=1), x_frame.min(axis=1)), axis=1)
 
 
 def waveshow(
@@ -380,6 +412,13 @@ def waveshow(
     downsampled amplitude envelope is used.
     This is done to limit the complexity of the visual elements to guarantee an
     efficient, visually interpretable plot.
+
+    The envelope is computed after removing each channel's mean (DC offset), so
+    the upper and lower envelopes are anchored to a zero baseline rather than
+    drifting with DC bias or resampling artifacts.  Each non-overlapping frame
+    contributes its own positive maximum and negative minimum, preserving the
+    true peak asymmetry of the signal instead of mirroring an absolute-value
+    envelope.
 
     When using interactive rendering (e.g., in a Jupyter notebook or IPython
     console), the plot will automatically update as the view-port is changed, either
@@ -578,6 +617,9 @@ def waveshow(
     if y.ndim == 1:
         y = y[np.newaxis, :]
 
+    if y.shape[-1] == 0:
+        raise ParameterError("Cannot plot an empty audio signal.")
+
     if max_points <= 0:
         raise ParameterError(f"max_points={max_points} must be strictly positive")
 
@@ -590,7 +632,7 @@ def waveshow(
     y_env = _envelope(y, hop_length)
 
     # Split the envelope into top and bottom
-    y_bottom, y_top = -y_env[-1], y_env[0]
+    y_bottom, y_top = y_env[-1, 1], y_env[0, 0]
 
     times = offset + core.times_like(y, sr=sr, hop_length=1)
 
@@ -688,6 +730,10 @@ def wavebars(
     This visualization is appropriate for displaying a simplified view of the
     signal, and is best suited for small figures where simplicity is desired.
 
+    As in `waveshow`, each channel is DC-centered before the envelope is
+    computed, and every segment uses its own positive maximum and negative
+    minimum so that the bars are anchored to a zero baseline.
+
     Parameters
     ----------
     y : np.ndarray [shape=(n,) or (2,n)]
@@ -784,6 +830,9 @@ def wavebars(
     if y.ndim == 1:
         y = y[np.newaxis, :]
 
+    if y.shape[-1] == 0:
+        raise ParameterError("Cannot plot an empty audio signal.")
+
     patch_kwargs.setdefault("linewidth", 0)
 
     axes = _check_axes(ax)
@@ -793,7 +842,7 @@ def wavebars(
 
     hop = max(1, y.shape[-1] // n_bars)
     env = _envelope(y, hop)
-    env_bottom, env_top = env[-1], env[0]
+    env_bottom, env_top = env[-1, 1], env[0, 0]
 
     bar_width = (hop / sr) * (1 - gap_ratio)
     rounding_size = bar_width * rounding_ratio
@@ -803,7 +852,10 @@ def wavebars(
     patches = []
     boxstyle = f"round,pad=0,rounding_size={rounding_size}"
     for t, a0, a1 in zip(times, env_bottom, env_top, strict=True):
-        base = min(-rounding_size, -a0)
+        # a0 is the signed lower envelope (<= 0) and a1 the upper (>= 0).
+        # Clamp each side to at least the rounding size so tiny frames still
+        # render a visible, non-degenerate bar.
+        base = min(-rounding_size, a0)
         top = max(rounding_size, a1)
         if transpose:
             xy, width, height = (base, t), top - base, bar_width
