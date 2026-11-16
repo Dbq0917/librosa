@@ -238,13 +238,40 @@ def frame(
 
     x = np.array(x, copy=False, subok=subok)
 
+    if not is_positive_int(frame_length):
+        raise ParameterError(
+            f"frame_length={frame_length!r} must be a positive integer",
+            parameter="frame_length",
+            value=frame_length,
+        )
+
+    if not is_positive_int(hop_length):
+        raise ParameterError(
+            f"hop_length={hop_length!r} must be a positive integer",
+            parameter="hop_length",
+            value=hop_length,
+        )
+
+    if not isinstance(axis, (int, np.integer)) or not -x.ndim <= axis < x.ndim:
+        raise ParameterError(
+            f"axis={axis!r} is out of bounds for input with {x.ndim} dimensions",
+            parameter="axis",
+            value=axis,
+        )
+
     if x.shape[axis] < frame_length:
         raise ParameterError(
-            f"Input is too short (n={x.shape[axis]:d}) for frame_length={frame_length:d}"
+            f"Input is too short (n={x.shape[axis]:d}) for frame_length={frame_length:d}",
+            parameter="frame_length",
+            value=frame_length,
         )
 
     if hop_length < 1:
-        raise ParameterError(f"Invalid hop_length: {hop_length:d}")
+        raise ParameterError(
+            f"Invalid hop_length: {hop_length:d}",
+            parameter="hop_length",
+            value=hop_length,
+        )
 
     # put our new within-frame axis at the end for now
     out_strides = x.strides + tuple([x.strides[axis]])
@@ -321,18 +348,28 @@ def valid_audio(y: np.ndarray) -> bool:
     ParameterError: Audio buffer is not finite everywhere
     """
     if not isinstance(y, np.ndarray):
-        raise ParameterError("Audio data must be of type numpy.ndarray")
+        raise ParameterError(
+            "Audio data must be of type numpy.ndarray",
+            parameter="y",
+            value=type(y),
+        )
 
     if not np.issubdtype(y.dtype, np.floating):
-        raise ParameterError("Audio data must be floating-point")
+        raise ParameterError(
+            "Audio data must be floating-point",
+            parameter="y",
+            value=y.dtype,
+        )
 
     if y.ndim == 0:
         raise ParameterError(
-            f"Audio data must be at least one-dimensional, given y.shape={y.shape}"
+            f"Audio data must be at least one-dimensional, given y.shape={y.shape}",
+            parameter="y",
+            value=y.shape,
         )
 
     if not np.isfinite(y).all():
-        raise ParameterError("Audio buffer is not finite everywhere")
+        raise ParameterError("Audio buffer is not finite everywhere", parameter="y")
 
     return True
 
@@ -365,7 +402,7 @@ def valid_int(x: float, *, cast: Callable[[float], float] | None = None) -> int:
         cast = np.floor
 
     if not callable(cast):
-        raise ParameterError("cast parameter must be callable")
+        raise ParameterError("cast parameter must be callable", parameter="cast")
 
     return int(cast(x))
 
@@ -405,10 +442,18 @@ def valid_intervals(intervals: np.ndarray) -> bool:
         True if ``intervals`` passes validation.
     """
     if intervals.ndim != 2 or intervals.shape[-1] != 2:
-        raise ParameterError("intervals must have shape (n, 2)")
+        raise ParameterError(
+            "intervals must have shape (n, 2)",
+            parameter="intervals",
+            value=intervals.shape,
+        )
 
     if np.any(intervals[:, 0] > intervals[:, 1]):
-        raise ParameterError(f"intervals={intervals} must have non-negative durations")
+        raise ParameterError(
+            f"intervals={intervals} must have non-negative durations",
+            parameter="intervals",
+            value=intervals,
+        )
 
     return True
 
@@ -481,7 +526,9 @@ def pad_center(
 
     if lpad < 0:
         raise ParameterError(
-            f"Target size ({size:d}) must be at least input size ({n:d})"
+            f"Target size ({size:d}) must be at least input size ({n:d})",
+            parameter="size",
+            value=size,
         )
 
     return np.pad(data, lengths, **kwargs)
@@ -543,12 +590,16 @@ def expand_to(
 
     if len(axes_tup) != x.ndim:
         raise ParameterError(
-            f"Shape mismatch between axes={axes_tup} and input x.shape={x.shape}"
+            f"Shape mismatch between axes={axes_tup} and input x.shape={x.shape}",
+            parameter="axes",
+            value=axes_tup,
         )
 
     if ndim < x.ndim:
         raise ParameterError(
-            f"Cannot expand x.shape={x.shape} to fewer dimensions ndim={ndim}"
+            f"Cannot expand x.shape={x.shape} to fewer dimensions ndim={ndim}",
+            parameter="ndim",
+            value=ndim,
         )
 
     shape: list[int] = [1] * ndim

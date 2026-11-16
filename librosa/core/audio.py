@@ -15,7 +15,7 @@ from numba import guvectorize, jit, stencil
 from .. import util
 from .._cache import cache
 from ..util.decorators import future_default
-from ..util.exceptions import ParameterError
+from ..util.exceptions import ParameterError, ProcessingError, processing_errors
 from ..util.files import example
 from .convert import frames_to_samples, time_to_samples
 
@@ -51,6 +51,79 @@ __all__ = [
     "mu_compress",
     "mu_expand",
 ]
+
+
+def _validate_positive_number(name: str, value: Any) -> None:
+    """Validate a scalar positive number and report the offending parameter."""
+    try:
+        valid = bool(np.isscalar(value) and np.isfinite(value) and value > 0)
+    except (TypeError, ValueError):
+        valid = False
+
+    if not valid:
+        raise ParameterError(
+            f"{name}={value!r} must be a positive number",
+            parameter=name,
+            value=value,
+        )
+
+
+def _validate_nonnegative_number(name: str, value: Any) -> None:
+    """Validate a scalar non-negative number and report the parameter."""
+    try:
+        valid = bool(np.isscalar(value) and np.isfinite(value) and value >= 0)
+    except (TypeError, ValueError):
+        valid = False
+
+    if not valid:
+        raise ParameterError(
+            f"{name}={value!r} must be a non-negative number",
+            parameter=name,
+            value=value,
+        )
+
+
+def _validate_positive_int(name: str, value: Any) -> None:
+    """Validate a positive integer parameter."""
+    try:
+        valid = util.is_positive_int(value)
+    except (TypeError, ValueError):
+        valid = False
+
+    if not valid:
+        raise ParameterError(
+            f"{name}={value!r} must be a positive integer",
+            parameter=name,
+            value=value,
+        )
+
+
+def _validate_dtype(dtype: DTypeLike) -> None:
+    """Validate that ``dtype`` can be interpreted by numpy/soundfile."""
+    try:
+        np.dtype(dtype)
+    except (TypeError, ValueError) as exc:
+        raise ParameterError(
+            f"dtype={dtype!r} is not a valid dtype",
+            parameter="dtype",
+            value=dtype,
+        ) from exc
+
+
+def _processing_iterator(iterator: Any, operation: str) -> Generator[Any, None, None]:
+    """Iterate over an external processing stream and classify failures."""
+    while True:
+        try:
+            item = next(iterator)
+        except StopIteration:
+            return
+        except Exception as exc:
+            raise ProcessingError(
+                f"{operation} failed: {exc}",
+                operation=operation,
+            ) from exc
+
+        yield item
 
 
 # -- CORE ROUTINES --#
@@ -153,6 +226,9 @@ def load(
     >>> sfo = soundfile.SoundFile(librosa.ex('brahms'))
     >>> y, sr = librosa.load(sfo)
     """
+    if sr is not None:
+        _validate_positive_number("sr", sr)
+
     y, sr_native = __soundfile_load(path, offset, duration, dtype)
 
     # Final cleanup for dtype and contiguity
@@ -170,30 +246,67 @@ def load(
 
 def __soundfile_load(path, offset, duration, dtype):
     """Load an audio buffer using soundfile."""
+    _validate_dtype(dtype)
+
+    try:
+        offset_valid = np.isscalar(offset) and np.isfinite(offset)
+    except (TypeError, ValueError):
+        offset_valid = False
+
+    if not offset_valid:
+        raise ParameterError(
+            f"offset={offset!r} must be a finite number",
+            parameter="offset",
+            value=offset,
+        )
+
+    if duration is not None:
+        _validate_nonnegative_number("duration", duration)
+
     if isinstance(path, sf.SoundFile):
         # If the user passed an existing soundfile object,
         # we can use it directly
         context = path
     else:
         # Otherwise, create the soundfile object
-        context = sf.SoundFile(path)
+        try:
+            context = sf.SoundFile(path)
+        except (TypeError, ValueError) as exc:
+            raise ParameterError(
+                f"path={path!r} could not be interpreted as an audio source: {exc}",
+                parameter="path",
+                value=path,
+            ) from exc
+        except Exception as exc:
+            raise ProcessingError(
+                f"opening audio source failed: {exc}",
+                operation="open audio source",
+            ) from exc
 
-    with context as sf_desc:
-        sr_native = sf_desc.samplerate
-        if offset != 0:
-            if offset > 0:
-                # Seek to the start of the target read
-                sf_desc.seek(int(offset * sr_native))
+    try:
+        with context as sf_desc:
+            sr_native = sf_desc.samplerate
+            if offset != 0:
+                if offset > 0:
+                    # Seek to the start of the target read
+                    sf_desc.seek(int(offset * sr_native))
+                else:
+                    sf_desc.seek(-int(abs(offset) * sr_native), whence=sf.SEEK_END)
+
+            if duration is not None:
+                frame_duration = int(duration * sr_native)
             else:
-                sf_desc.seek(-int(abs(offset) * sr_native), whence=sf.SEEK_END)
+                frame_duration = -1
 
-        if duration is not None:
-            frame_duration = int(duration * sr_native)
-        else:
-            frame_duration = -1
-
-        # Load the target number of frames, and transpose to match librosa form
-        y = sf_desc.read(frames=frame_duration, dtype=dtype, always_2d=False).T
+            # Load the target number of frames, and transpose to match librosa form
+            y = sf_desc.read(frames=frame_duration, dtype=dtype, always_2d=False).T
+    except ParameterError:
+        raise
+    except Exception as exc:
+        raise ProcessingError(
+            f"reading audio data failed: {exc}",
+            operation="read audio data",
+        ) from exc
 
     return y, sr_native
 
@@ -213,7 +326,10 @@ def _align_step_size(target_step, target_sr, orig_sr):
     if not np.isclose(exact_native_step, aligned_native_step, rtol=1e-7, atol=1e-5):
         raise ParameterError(
             f"Target block step of {target_step} samples at {target_sr} results in a "
-            f"fractional sample advance at original sampling rate {orig_sr}."
+            f"fractional sample advance at original sampling rate {orig_sr}. "
+            "Choose a block/hop configuration compatible with both sampling rates.",
+            parameter="hop_length",
+            operation=None,
         )
 
     return int(aligned_native_step)
@@ -382,23 +498,51 @@ def stream(
     ...                                              hop_length=2048,
     ...                                              center=False)
     """
-    if not util.is_positive_int(block_length):
-        raise ParameterError(f"block_length={block_length} must be a positive integer")
-    if not util.is_positive_int(frame_length):
-        raise ParameterError(f"frame_length={frame_length} must be a positive integer")
-    if not util.is_positive_int(hop_length):
-        raise ParameterError(f"hop_length={hop_length} must be a positive integer")
+    _validate_positive_int("block_length", block_length)
+    _validate_positive_int("frame_length", frame_length)
+    _validate_positive_int("hop_length", hop_length)
+    _validate_dtype(dtype)
+    if duration is not None:
+        _validate_nonnegative_number("duration", duration)
 
-    if sr is not None and not (np.isfinite(sr) and sr > 0):
-        raise ParameterError(f"sr={sr} must be a positive number")
+    try:
+        offset_valid = np.isscalar(offset) and np.isfinite(offset)
+    except (TypeError, ValueError):
+        offset_valid = False
+
+    if not offset_valid:
+        raise ParameterError(
+            f"offset={offset!r} must be a finite number",
+            parameter="offset",
+            value=offset,
+        )
+
+    if sr is not None:
+        _validate_positive_number("sr", sr)
 
     if res_type not in {"soxr_vhq", "soxr_hq", "soxr_mq", "soxr_lq", "soxr_qq"}:
-        raise ParameterError(f"res_type={res_type} is not a valid soxr resampling mode for streaming")
+        raise ParameterError(
+            f"res_type={res_type!r} is not a valid soxr resampling mode for streaming",
+            parameter="res_type",
+            value=res_type,
+        )
 
     if isinstance(path, sf.SoundFile):
         sfo = path
     else:
-        sfo = sf.SoundFile(path)
+        try:
+            sfo = sf.SoundFile(path)
+        except (TypeError, ValueError) as exc:
+            raise ParameterError(
+                f"path={path!r} could not be interpreted as an audio source: {exc}",
+                parameter="path",
+                value=path,
+            ) from exc
+        except Exception as exc:
+            raise ProcessingError(
+                f"opening audio source failed: {exc}",
+                operation="open audio source",
+            ) from exc
 
     # Get the sample rate from the file info
     orig_sr = sfo.samplerate
@@ -423,13 +567,19 @@ def stream(
         read_frames = int(duration * orig_sr) if duration is not None else -1
 
         if needs_resampling:
-            resampler = soxr.ResampleStream(
-                in_rate=orig_sr,
-                out_rate=sr,
-                num_channels=process_channels,
-                dtype=dtype,
-                quality=res_type,
-            )
+            try:
+                resampler = soxr.ResampleStream(
+                    in_rate=orig_sr,
+                    out_rate=sr,
+                    num_channels=process_channels,
+                    dtype=dtype,
+                    quality=res_type,
+                )
+            except Exception as exc:
+                raise ProcessingError(
+                    f"initializing audio resampler failed: {exc}",
+                    operation="initialize audio resampler",
+                ) from exc
 
         capacity = target_yield_size + (target_advance * 2)
         buffer_shape = (capacity,) if process_channels == 1 else (capacity, process_channels)
@@ -437,10 +587,16 @@ def stream(
         write_idx = 0
         read_idx = 0
 
-        if offset >= 0:
-            sfo.seek(int(offset * orig_sr))
-        else:
-            sfo.seek(-int(abs(offset) * orig_sr), whence=sf.SEEK_END)
+        try:
+            if offset >= 0:
+                sfo.seek(int(offset * orig_sr))
+            else:
+                sfo.seek(-int(abs(offset) * orig_sr), whence=sf.SEEK_END)
+        except Exception as exc:
+            raise ProcessingError(
+                f"seeking in audio source failed: {exc}",
+                operation="seek audio source",
+            ) from exc
 
         # Reusable buffer for the per-chunk mono downmix; the final short
         # chunk writes into a truncated view of it, avoiding a fresh
@@ -451,11 +607,21 @@ def stream(
             else None
         )
 
-        for orig_chunk in sfo.blocks(blocksize=orig_read_size,
-                                     overlap=0,
-                                     dtype=dtype,
-                                     always_2d=False,
-                                     frames=read_frames):
+        try:
+            chunks = sfo.blocks(
+                blocksize=orig_read_size,
+                overlap=0,
+                dtype=dtype,
+                always_2d=False,
+                frames=read_frames,
+            )
+        except Exception as exc:
+            raise ProcessingError(
+                f"opening audio stream failed: {exc}",
+                operation="open audio stream",
+            ) from exc
+
+        for orig_chunk in _processing_iterator(chunks, "read audio stream"):
 
             if mono and is_multichannel:
                 # soundfile returns (samples, channels), to_mono expects (channels, samples)
@@ -465,7 +631,13 @@ def stream(
                 )
 
             if needs_resampling:
-                target_chunk = resampler.resample_chunk(orig_chunk)
+                try:
+                    target_chunk = resampler.resample_chunk(orig_chunk)
+                except Exception as exc:
+                    raise ProcessingError(
+                        f"streaming resample failed: {exc}",
+                        operation="streaming resample",
+                    ) from exc
             else:
                 target_chunk = orig_chunk
             n_incoming = target_chunk.shape[0]
@@ -499,7 +671,13 @@ def stream(
             empty = np.empty((0, process_channels), dtype=buffer.dtype)
 
         if needs_resampling:
-            tail_chunk = resampler.resample_chunk(empty, last=True)
+            try:
+                tail_chunk = resampler.resample_chunk(empty, last=True)
+            except Exception as exc:
+                raise ProcessingError(
+                    f"flushing audio resampler failed: {exc}",
+                    operation="flush audio resampler",
+                ) from exc
         else:
             tail_chunk = None
 
@@ -596,8 +774,12 @@ def loadx(key: str, *, hq: bool | None = None, **kwargs: Any) -> tuple[np.ndarra
     try:
         path = example(key, hq=hq)
     except ParameterError as exc:
-        raise ParameterError(f"Could not load example with key '{key}'.  "
-                             "Did you mean to use librosa.load instead of loadx?") from exc
+        raise ParameterError(
+            f"Could not load example with key '{key}'.  "
+            "Did you mean to use librosa.load instead of loadx?",
+            parameter="key",
+            value=key,
+        ) from exc
 
     return load(path, **kwargs)
 
@@ -616,10 +798,16 @@ def _init_output(
     if out is None:
         return np.zeros(shape, dtype=dtype)
     if out.shape != shape:
-        raise ParameterError(f"out has shape={out.shape}, but expected {shape}")
+        raise ParameterError(
+            f"out has shape={out.shape}, but expected {shape}",
+            parameter="out",
+            value=out.shape,
+        )
     if np.promote_types(out.dtype, dtype) != out.dtype:
         raise ParameterError(
-            f"out has dtype={out.dtype}, which cannot hold the result dtype {dtype}"
+            f"out has dtype={out.dtype}, which cannot hold the result dtype {dtype}",
+            parameter="out",
+            value=out.dtype,
         )
     out[...] = 0
     return out
@@ -706,7 +894,10 @@ def to_mono(
     """
     # Validate the buffer(s) and identify lengths, dtypes, etc
     if not signals:
-        raise ParameterError("At least one signal must be provided to `to_mono`.")
+        raise ParameterError(
+            "At least one signal must be provided to `to_mono`.",
+            parameter="signals",
+        )
     n_min, n_max = signals[0].shape[-1], signals[0].shape[-1]
     dtype = signals[0].dtype
     for y in signals:
@@ -822,7 +1013,10 @@ def to_stereo(
     # This flag tracks whether we had only one signal to begin with
     onesided = True
     if left is None and right is None:
-        raise ParameterError("At least one of 'left' or 'right' must be provided")
+        raise ParameterError(
+            "At least one of 'left' or 'right' must be provided",
+            parameter="left",
+        )
 
     elif left is None:
         # These are somewhat inefficient ways to allocate a silent channel,
@@ -864,7 +1058,9 @@ def to_stereo(
             output[:] = left
         else:
             raise ParameterError(
-                f"left input has unsupported shape {left.shape} for downmix=False"
+                f"left input has unsupported shape {left.shape} for downmix=False",
+                parameter="left",
+                value=left.shape,
             )
 
         if right.ndim == 1:
@@ -873,7 +1069,9 @@ def to_stereo(
             output[:] += right
         else:
             raise ParameterError(
-                f"right input has unsupported shape {right.shape} for downmix=False"
+                f"right input has unsupported shape {right.shape} for downmix=False",
+                parameter="right",
+                value=right.shape,
             )
         if norm and not onesided:
             # Only normalize here if we had both channels on input
@@ -947,7 +1145,7 @@ def to_multi(
     """
     # Validate the buffer(s) and identify lengths, dtypes, etc
     if not signals:
-        raise ParameterError("At least one signal must be provided.")
+        raise ParameterError("At least one signal must be provided.", parameter="signals")
     n_min, n_max = signals[0].shape[-1], signals[0].shape[-1]
     dtype = signals[0].dtype
     if downmix:
@@ -966,7 +1164,9 @@ def to_multi(
         dtype = np.promote_types(dtype, y.dtype)
         if not downmix and y.shape[:-1] != channel_layout:
             raise ParameterError(
-                f"Cannot combine signals with different channel layouts {y.shape[:-1]} when downmix=False"
+                f"Cannot combine signals with different channel layouts {y.shape[:-1]} when downmix=False",
+                parameter="signals",
+                value=y.shape[:-1],
             )
 
     # Allocate and initialize the output buffer
@@ -1114,6 +1314,46 @@ def resample(
     """
     # First, validate the audio buffer
     util.valid_audio(y)
+    _validate_positive_number("orig_sr", orig_sr)
+    _validate_positive_number("target_sr", target_sr)
+
+    if not isinstance(res_type, str):
+        raise ParameterError(
+            f"res_type={res_type!r} must be a string",
+            parameter="res_type",
+            value=res_type,
+        )
+
+    supported_types = {
+        "scipy",
+        "fft",
+        "polyphase",
+        "linear",
+        "zero_order_hold",
+        "sinc_best",
+        "sinc_fastest",
+        "sinc_medium",
+        "soxr_vhq",
+        "soxr_hq",
+        "soxr_mq",
+        "soxr_lq",
+        "soxr_qq",
+        "kaiser_best",
+        "kaiser_fast",
+    }
+    if res_type not in supported_types:
+        raise ParameterError(
+            f"res_type={res_type!r} is not a supported resampling mode",
+            parameter="res_type",
+            value=res_type,
+        )
+
+    if not isinstance(axis, (int, np.integer)) or not -y.ndim <= axis < y.ndim:
+        raise ParameterError(
+            f"axis={axis!r} is out of bounds for y with {y.ndim} dimensions",
+            parameter="axis",
+            value=axis,
+        )
 
     if orig_sr == target_sr:
         return y
@@ -1125,11 +1365,13 @@ def resample(
     if res_type in ("scipy", "fft"):
         import scipy.signal
 
-        y_hat = scipy.signal.resample(y, n_samples, axis=axis)
+        with processing_errors("FFT resampling"):
+            y_hat = scipy.signal.resample(y, n_samples, axis=axis)
     elif res_type == "polyphase":
         if int(orig_sr) != orig_sr or int(target_sr) != target_sr:
             raise ParameterError(
-                "polyphase resampling is only supported for integer-valued sampling rates."
+                "polyphase resampling is only supported for integer-valued sampling rates.",
+                parameter="orig_sr" if int(orig_sr) != orig_sr else "target_sr",
             )
 
         import scipy.signal
@@ -1140,9 +1382,10 @@ def resample(
         orig_sr = int(orig_sr)
         target_sr = int(target_sr)
         gcd = np.gcd(orig_sr, target_sr)
-        y_hat = scipy.signal.resample_poly(
-            y, target_sr // gcd, orig_sr // gcd, axis=axis
-        )
+        with processing_errors("polyphase resampling"):
+            y_hat = scipy.signal.resample_poly(
+                y, target_sr // gcd, orig_sr // gcd, axis=axis
+            )
     elif res_type in (
         "linear",
         "zero_order_hold",
@@ -1152,22 +1395,31 @@ def resample(
     ):
         # Use numpy to vectorize the resampler along the target axis
         # This is because samplerate does not support ndim>2 generally.
-        y_hat = np.apply_along_axis(
-            samplerate.resample, axis=axis, arr=y, ratio=ratio, converter_type=res_type
-        )
+        with processing_errors("samplerate resampling"):
+            y_hat = np.apply_along_axis(
+                samplerate.resample,
+                axis=axis,
+                arr=y,
+                ratio=ratio,
+                converter_type=res_type,
+            )
     elif res_type.startswith("soxr"):
         # Use numpy to vectorize the resampler along the target axis
         # This is because soxr does not support ndim>2 generally.
-        y_hat = np.apply_along_axis(
-            soxr.resample,
-            axis=axis,
-            arr=y,
-            in_rate=orig_sr,
-            out_rate=target_sr,
-            quality=res_type,
-        )
+        with processing_errors("soxr resampling"):
+            y_hat = np.apply_along_axis(
+                soxr.resample,
+                axis=axis,
+                arr=y,
+                in_rate=orig_sr,
+                out_rate=target_sr,
+                quality=res_type,
+            )
     else:
-        y_hat = resampy.resample(y, orig_sr, target_sr, filter=res_type, axis=axis)
+        with processing_errors("resampy resampling"):
+            y_hat = resampy.resample(
+                y, orig_sr, target_sr, filter=res_type, axis=axis
+            )
 
     if fix:
         y_hat = util.fix_length(y_hat, size=n_samples, axis=axis, **kwargs)
@@ -1267,11 +1519,26 @@ def get_duration(
     5.224489795918367
     """
     if path is not None:
-        return sf.info(path).duration  # type: ignore
+        try:
+            return sf.info(path).duration  # type: ignore
+        except (TypeError, ValueError) as exc:
+            raise ParameterError(
+                f"path={path!r} could not be interpreted as an audio source: {exc}",
+                parameter="path",
+                value=path,
+            ) from exc
+        except Exception as exc:
+            raise ProcessingError(
+                f"inspecting audio source failed: {exc}",
+                operation="inspect audio source",
+            ) from exc
 
     if y is None:
         if S is None:
-            raise ParameterError("At least one of (y, sr), S, or path must be provided")
+            raise ParameterError(
+                "At least one of (y, sr), S, or path must be provided",
+                parameter="y",
+            )
 
         n_frames = S.shape[-1]
         n_samples = n_fft + hop_length * (n_frames - 1)
@@ -1283,6 +1550,7 @@ def get_duration(
     else:
         n_samples = y.shape[-1]
 
+    _validate_positive_number("sr", sr)
     return float(n_samples) / sr
 
 
@@ -1310,10 +1578,22 @@ def get_samplerate(path: str | int | sf.SoundFile | BinaryIO) -> float:
     >>> librosa.get_samplerate(path)
     22050
     """
-    if isinstance(path, sf.SoundFile):
-        return path.samplerate  # type: ignore
+    try:
+        if isinstance(path, sf.SoundFile):
+            return path.samplerate  # type: ignore
 
-    return sf.info(path).samplerate  # type: ignore
+        return sf.info(path).samplerate  # type: ignore
+    except (TypeError, ValueError) as exc:
+        raise ParameterError(
+            f"path={path!r} could not be interpreted as an audio source: {exc}",
+            parameter="path",
+            value=path,
+        ) from exc
+    except Exception as exc:
+        raise ProcessingError(
+            f"reading audio source metadata failed: {exc}",
+            operation="read audio source metadata",
+        ) from exc
 
 
 @cache(level=20)
@@ -1809,10 +2089,16 @@ def clicks(
     >>> ax[0].set_title(None)
     """
     # Compute sample positions from time or frames
+    _validate_positive_number("sr", sr)
+    _validate_positive_int("hop_length", hop_length)
+
     positions: np.ndarray
     if times is None:
         if frames is None:
-            raise ParameterError('either "times" or "frames" must be provided')
+            raise ParameterError(
+                'either "times" or "frames" must be provided',
+                parameter="times",
+            )
 
         positions = frames_to_samples(frames, hop_length=hop_length)
     else:
@@ -1828,10 +2114,18 @@ def clicks(
         click_freq = util._ensure_hz(click_freq)
 
         if click_duration <= 0:
-            raise ParameterError("click_duration must be strictly positive")
+            raise ParameterError(
+                "click_duration must be strictly positive",
+                parameter="click_duration",
+                value=click_duration,
+            )
 
         if click_freq <= 0:
-            raise ParameterError("click_freq must be strictly positive")
+            raise ParameterError(
+                "click_freq must be strictly positive",
+                parameter="click_freq",
+                value=click_freq,
+            )
 
         angular_freq = 2 * np.pi * click_freq / float(sr)
 
@@ -1843,8 +2137,7 @@ def clicks(
     if length is None:
         length = positions.max() + click.shape[-1]
     else:
-        if length < 1:
-            raise ParameterError("length must be a positive integer")
+        _validate_positive_int("length", length)
 
         # Filter out any positions past the length boundary
         positions = positions[positions < length]
@@ -1925,15 +2218,23 @@ def tone(
     ...                          x_axis='time', y_axis='mel', ax=ax)
     """
     if frequency is None:
-        raise ParameterError('"frequency" must be provided')
+        raise ParameterError('"frequency" must be provided', parameter="frequency")
 
     frequency = util._ensure_hz(frequency)
+    _validate_positive_number("frequency", frequency)
+    _validate_positive_number("sr", sr)
 
     # Compute signal length
     if length is None:
         if duration is None:
-            raise ParameterError('either "length" or "duration" must be provided')
+            raise ParameterError(
+                'either "length" or "duration" must be provided',
+                parameter="length",
+            )
+        _validate_positive_number("duration", duration)
         length = int(duration * sr)
+    else:
+        _validate_positive_int("length", length)
 
     if phi is None:
         phi = -np.pi * 0.5
@@ -2031,17 +2332,28 @@ def chirp(
     >>> ax[1].set(title='Linear chirp')
     """
     if fmin is None or fmax is None:
-        raise ParameterError('both "fmin" and "fmax" must be provided')
+        raise ParameterError(
+            'both "fmin" and "fmax" must be provided',
+            parameter="fmin" if fmin is None else "fmax",
+        )
 
     fmin = util._ensure_hz(fmin)
     fmax = util._ensure_hz(fmax)
+    _validate_positive_number("fmin", fmin)
+    _validate_positive_number("fmax", fmax)
+    _validate_positive_number("sr", sr)
 
     # Compute signal duration
     period = 1.0 / sr
     if length is None:
         if duration is None:
-            raise ParameterError('either "length" or "duration" must be provided')
+            raise ParameterError(
+                'either "length" or "duration" must be provided',
+                parameter="length",
+            )
+        _validate_positive_number("duration", duration)
     else:
+        _validate_positive_int("length", length)
         duration = period * length
 
     if phi is None:
@@ -2132,11 +2444,16 @@ def mu_compress(
     """
     if mu <= 0:
         raise ParameterError(
-            f"mu-law compression parameter mu={mu} must be strictly positive."
+            f"mu-law compression parameter mu={mu} must be strictly positive.",
+            parameter="mu",
+            value=mu,
         )
 
     if np.any(x < -1) or np.any(x > 1):
-        raise ParameterError(f"mu-law input x={x} must be in the range [-1, +1].")
+        raise ParameterError(
+            f"mu-law input x={x} must be in the range [-1, +1].",
+            parameter="x",
+        )
 
     x_comp: np.ndarray = np.sign(x) * np.log1p(mu * np.abs(x)) / np.log1p(mu)
 
@@ -2231,7 +2548,9 @@ def mu_expand(
     """
     if mu <= 0:
         raise ParameterError(
-            f"Inverse mu-law compression parameter mu={mu} must be strictly positive."
+            f"Inverse mu-law compression parameter mu={mu} must be strictly positive.",
+            parameter="mu",
+            value=mu,
         )
 
     if quantize:
@@ -2239,7 +2558,8 @@ def mu_expand(
 
     if np.any(x < -1) or np.any(x > 1):
         raise ParameterError(
-            f"Inverse mu-law input x={x} must be in the range [-1, +1]."
+            f"Inverse mu-law input x={x} must be in the range [-1, +1].",
+            parameter="x",
         )
 
     y: np.ndarray | np.floating = np.sign(x) / mu * (np.power(1 + mu, np.abs(x)) - 1)

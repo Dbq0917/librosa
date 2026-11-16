@@ -99,8 +99,12 @@ from .core import tuning_to_A4 as tuning_to_A4
 from .core import vqt as vqt
 from .core import yin as yin
 from .core import zero_crossings as zero_crossings
+from .util.exceptions import InputError as InputError
 from .util.exceptions import LibrosaError as LibrosaError
+from .util.exceptions import LibrosaParameterError as LibrosaParameterError
+from .util.exceptions import LibrosaProcessingError as LibrosaProcessingError
 from .util.exceptions import ParameterError as ParameterError
+from .util.exceptions import ProcessingError as ProcessingError
 from .util.files import cite as cite
 from .util.files import ex as ex
 from .util.files import example as example

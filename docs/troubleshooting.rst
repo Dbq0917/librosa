@@ -8,6 +8,19 @@ For bug reports and other, more technical issues, consult the `github issues
 
 Here are a few of the most common problems that users encounter.
 
+Which exception did I catch?
+^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+librosa reports bad arguments as :class:`librosa.ParameterError` and failures
+from decoding, resampling, or other processing backends as
+:class:`librosa.ProcessingError`.  Both remain subclasses of
+:class:`librosa.LibrosaError`, and the historical ``ParameterError`` and
+``LibrosaParameterError`` names still work.
+
+Inspect ``exc.layer`` (``"parameter"`` or ``"processing"``) or log ``str(exc)``
+directly; the layer is included in the message.  See :doc:`api/exceptions`
+for the compatibility table and handler examples.
+
 no attribute 'display'
 ^^^^^^^^^^^^^^^^^^^^^^
 

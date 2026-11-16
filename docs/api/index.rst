@@ -17,4 +17,5 @@ API documentation
     effects
     segment
     sequence
+    exceptions
     util

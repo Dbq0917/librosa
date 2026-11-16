@@ -2,6 +2,12 @@ from . import decorators, exceptions
 from ._nnls import nnls as nnls
 from .deprecation import Deprecated as Deprecated
 from .deprecation import rename_kw as rename_kw
+from .exceptions import InputError as InputError
+from .exceptions import LibrosaError as LibrosaError
+from .exceptions import LibrosaParameterError as LibrosaParameterError
+from .exceptions import LibrosaProcessingError as LibrosaProcessingError
+from .exceptions import ParameterError as ParameterError
+from .exceptions import ProcessingError as ProcessingError
 from .files import cite as cite
 from .files import ex as ex
 from .files import example as example
