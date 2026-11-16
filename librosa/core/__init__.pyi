@@ -9,7 +9,6 @@ from .audio import lpc as lpc
 from .audio import mu_compress as mu_compress
 from .audio import mu_expand as mu_expand
 from .audio import resample as resample
-from .audio import stream as stream
 from .audio import to_mono as to_mono
 from .audio import to_multi as to_multi
 from .audio import to_stereo as to_stereo
@@ -98,3 +97,4 @@ from .spectrum import power_to_db as power_to_db
 from .spectrum import reassigned_spectrogram as reassigned_spectrogram
 from .spectrum import stft as stft
 from .streaming import StreamBridge as StreamBridge
+from .streaming import stream as stream
