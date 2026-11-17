@@ -9,6 +9,7 @@ from typing import TYPE_CHECKING
 import numpy as np
 
 from .. import filters, util
+from .._cache import cache
 from ..core.audio import zero_crossings
 from ..core.constantq import cqt, hybrid_cqt, vqt
 from ..core.convert import fft_frequencies
@@ -1885,6 +1886,7 @@ def tonnetz(
 
 
 # -- Mel spectrogram and MFCCs -- #
+@cache(level=10, always_wrap=True)
 def mfcc(
     *,
     y: np.ndarray | None = None,
@@ -2088,6 +2090,7 @@ def mfcc(
         raise ParameterError(f"MFCC lifter={lifter} must be a non-negative number")
 
 
+@cache(level=10, always_wrap=True)
 def melspectrogram(
     *,
     y: np.ndarray | None = None,

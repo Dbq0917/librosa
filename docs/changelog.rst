@@ -2,6 +2,14 @@
 Changelog
 *********
 
+v1.1 (unreleased)
+=================
+
+Enhancements
+    - Added a bounded, persistent block cache for feature extraction with
+      LRU eviction, cross-process reuse, versioned invalidation, parameter
+      prefix clearing, corruption recovery, and hit-rate reporting.
+
 v1.0
 ====
 

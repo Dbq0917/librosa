@@ -2967,20 +2967,182 @@ def _spectrogram(
             raise ParameterError(
                 "Input signal must be provided to compute a spectrogram"
             )
-        S = np.abs(
-            stft(
+        if _can_use_block_cache(
+            y=y,
+            n_fft=n_fft,
+            hop_length=hop_length,
+            center=center,
+            pad_mode=pad_mode,
+        ):
+            S = _stft_from_cache(
                 y,
                 n_fft=n_fft,
                 hop_length=hop_length,
                 win_length=win_length,
-                center=center,
                 window=window,
+                center=center,
                 pad_mode=pad_mode,
+                magnitude=True,
             )
-        )
+        else:
+            S = np.abs(
+                stft(
+                    y,
+                    n_fft=n_fft,
+                    hop_length=hop_length,
+                    win_length=win_length,
+                    center=center,
+                    window=window,
+                    pad_mode=pad_mode,
+                )
+            )
         if power == 2:
             np.square(S, out=S)
         elif power != 1:
             S **= power
 
     return S, n_fft
+
+
+def _can_use_block_cache(
+    *,
+    y: np.ndarray,
+    n_fft: int,
+    hop_length: int | None,
+    center: bool,
+    pad_mode: _PadModeSTFT,
+) -> bool:
+    """Check whether a signal can be safely split into STFT frame blocks."""
+    blocked_pad_modes = {"wrap", "maximum", "mean", "median", "minimum"}
+    return (
+        cache.enabled
+        and cache.level >= 10
+        and isinstance(y, np.ndarray)
+        and y.ndim >= 1
+        and util.is_positive_int(n_fft)
+        and util.is_positive_int(hop_length)
+        and y.shape[-1] >= n_fft
+        and isinstance(pad_mode, str)
+        and not (center and pad_mode in blocked_pad_modes)
+    )
+
+
+def _stft_from_cache(
+    y: np.ndarray,
+    *,
+    n_fft: int,
+    hop_length: int,
+    win_length: int | None,
+    window: _WindowSpec,
+    center: bool,
+    pad_mode: _PadModeSTFT,
+    dtype: DTypeLike | None = None,
+    magnitude: bool = False,
+) -> np.ndarray:
+    """Compute an STFT block-by-block, reusing blocks from the cache.
+
+    When ``magnitude`` is set, the cached blocks contain ``abs(STFT)``.
+    This lets downstream Mel/chroma parameters reuse the spectrogram
+    without rebuilding the complex STFT.
+    """
+    if center:
+        padding = [(0, 0)] * y.ndim
+        padding[-1] = (n_fft // 2, n_fft // 2)
+        signal = np.pad(y, padding, mode=pad_mode)
+    else:
+        signal = y
+
+    n_frames = int(1 + (signal.shape[-1] - n_fft) // hop_length)
+    if n_frames < 1:
+        result = stft(
+            y,
+            n_fft=n_fft,
+            hop_length=hop_length,
+            win_length=win_length,
+            center=center,
+            window=window,
+            pad_mode=pad_mode,
+            dtype=dtype,
+        )
+        return np.abs(result) if magnitude else result
+
+    block_frames = max(1, int(cache.block_frames))
+    n_blocks = (n_frames + block_frames - 1) // block_frames
+    key = cache.key(
+        "librosa.core.spectrum.stft.blocks",
+        y=y,
+        n_fft=n_fft,
+        hop_length=hop_length,
+        win_length=win_length,
+        window=window,
+        center=center,
+        pad_mode=pad_mode,
+        dtype=dtype,
+        block_frames=block_frames,
+        magnitude=magnitude,
+    )
+    prepared_key = cache.prepare(key)
+    complex_dtype = np.dtype(dtype) if dtype is not None else util.dtype_r2c(y.dtype)
+    expected_dtype = (
+        np.empty(1, dtype=complex_dtype).real.dtype if magnitude else complex_dtype
+    )
+    expected_shape = (*y.shape[:-1], 1 + n_fft // 2)
+
+    blocks: list[np.ndarray | None] = [None] * n_blocks
+    for idx in range(n_blocks):
+        frame_start = idx * block_frames
+        frame_stop = min(frame_start + block_frames, n_frames)
+        count = frame_stop - frame_start
+        hit, value = cache.lookup_prepared(prepared_key, block=idx)
+        if hit and _valid_stft_block(
+            value, expected_shape=expected_shape, expected_dtype=expected_dtype, frames=count
+        ):
+            blocks[idx] = value
+        elif hit:
+            cache.delete(key, block=idx)
+
+    raw_stft = getattr(stft, "__wrapped__", stft)
+    for idx, block in enumerate(blocks):
+        if block is not None:
+            continue
+        frame_start = idx * block_frames
+        frame_stop = min(frame_start + block_frames, n_frames)
+        count = frame_stop - frame_start
+        sample_start = frame_start * hop_length
+        sample_stop = (frame_stop - 1) * hop_length + n_fft
+        segment = signal[..., sample_start:sample_stop]
+        if segment.shape[-1] < sample_stop - sample_start:
+            padding = [(0, 0)] * segment.ndim
+            padding[-1] = (0, sample_stop - sample_start - segment.shape[-1])
+            segment = np.pad(segment, padding, mode="constant")
+        value = raw_stft(
+            segment,
+            n_fft=n_fft,
+            hop_length=hop_length,
+            win_length=win_length,
+            window=window,
+            center=False,
+            dtype=dtype,
+        )[..., :count]
+        if magnitude:
+            value = np.abs(value)
+        cache.put_prepared(prepared_key, value, block=idx)
+        blocks[idx] = value
+
+    return np.concatenate([block for block in blocks if block is not None], axis=-1)
+
+
+def _valid_stft_block(
+    value: Any,
+    *,
+    expected_shape: tuple[int, ...],
+    expected_dtype: np.dtype,
+    frames: int,
+) -> bool:
+    """Validate a cached STFT block before using it."""
+    return (
+        isinstance(value, np.ndarray)
+        and value.dtype == expected_dtype
+        and value.shape[:-1] == expected_shape
+        and value.shape[-1] == frames
+    )
